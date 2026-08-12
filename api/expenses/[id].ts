@@ -47,21 +47,44 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
     await updateRow(sheetId, 'expenses', found.rowNumber, expenseToRow(updated))
 
-    // Borrar splits existentes y recalcular
+    // Leer splits existentes para determinar si cambiaron los excluidos
     const oldSplits = await findRows(sheetId, 'expense_splits', 1, id)
-    await deleteRows(sheetId, 'expense_splits', oldSplits.map(r => r.rowNumber))
+    const existingSplits = oldSplits.map(r => rowToSplit(r.row))
 
-    const memberRows = await readRows(sheetId, 'members')
-    const members = memberRows.map(rowToMember)
-    const splits = calculateSplits(payload.amount, members, payload.excluded_member_ids, exchangeRate)
-    const newSplits: ExpenseSplit[] = splits.map(s => ({
-      id: crypto.randomUUID(),
-      expense_id: id,
-      user_id: s.member_id,
-      percentage: s.percentage,
-      amount: s.amount,
-      is_excluded: s.is_excluded,
-    }))
+    const existingExcludedIds = existingSplits
+      .filter(s => s.is_excluded)
+      .map(s => s.user_id)
+      .sort()
+    const newExcludedIds = [...(payload.excluded_member_ids || [])].sort()
+    const exclusionsChanged =
+      existingExcludedIds.length !== newExcludedIds.length ||
+      existingExcludedIds.some((eid, i) => eid !== newExcludedIds[i])
+
+    let newSplits: ExpenseSplit[]
+
+    if (exclusionsChanged) {
+      // Excluidos cambiaron: recalcular desde salarios actuales
+      const memberRows = await readRows(sheetId, 'members')
+      const members = memberRows.map(rowToMember)
+      const splits = calculateSplits(payload.amount, members, payload.excluded_member_ids, exchangeRate)
+      newSplits = splits.map(s => ({
+        id: crypto.randomUUID(),
+        expense_id: id,
+        user_id: s.member_id,
+        percentage: s.percentage,
+        amount: s.amount,
+        is_excluded: s.is_excluded,
+      }))
+    } else {
+      // Excluidos no cambiaron: preservar porcentajes históricos, recalcular montos sobre el nuevo importe
+      newSplits = existingSplits.map(s => ({
+        ...s,
+        id: crypto.randomUUID(),
+        amount: s.is_excluded ? 0 : (s.percentage / 100) * payload.amount,
+      }))
+    }
+
+    await deleteRows(sheetId, 'expense_splits', oldSplits.map(r => r.rowNumber))
     for (const split of newSplits) {
       await appendRow(sheetId, 'expense_splits', splitToRow(split))
     }
